@@ -1,4 +1,7 @@
 import { spawn } from 'node:child_process';
+import { appendFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { format } from 'node:util';
 import { createHash } from 'node:crypto';
 import { readFile, writeFile, access, realpath, mkdir, rm, stat, readdir } from 'node:fs/promises';
 import path from 'node:path';
@@ -7,9 +10,37 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const defaultRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const identityPath = '/__kirinji_launcher__';
 
+let logging = false;
+function initializeLog(root) {
+  let filename = path.join(root, 'startup.log');
+  const header = `\n[${new Date().toISOString()}] Kirinji launcher PID ${process.pid}\nNode.js ${process.versions.node}; ${process.platform} ${process.arch}\n`;
+  try { appendFileSync(filename, header, 'utf8'); }
+  catch {
+    filename = path.join(tmpdir(), `kirinji-startup-${Date.now()}.log`);
+    appendFileSync(filename, header, 'utf8');
+  }
+  for (const name of ['log', 'error', 'warn']) {
+    const original = console[name].bind(console);
+    console[name] = (...args) => {
+      original(...args);
+      try { appendFileSync(filename, format(...args) + '\n', 'utf8'); } catch { /* Console output still works. */ }
+    };
+  }
+  logging = filename;
+  console.log(`起動の記録：${filename}`);
+}
+
 function run(command, args, cwd) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, stdio: 'inherit', windowsHide: true });
+    const child = spawn(command, args, { cwd, stdio: ['inherit', 'pipe', 'pipe'], windowsHide: true });
+    const relay = (output, stream) => {
+      output.on('data', chunk => {
+        stream.write(chunk);
+        if (logging) { try { appendFileSync(logging, chunk); } catch { /* Preserve console output. */ } }
+      });
+    };
+    relay(child.stdout, process.stdout);
+    relay(child.stderr, process.stderr);
     child.once('error', reject);
     child.once('exit', code => code === 0 ? resolve() : reject(new Error(`準備に失敗しました（終了コード ${code}）。インターネット接続を確認して、もう一度起動してください。`)));
   });
@@ -69,20 +100,27 @@ async function prepareStandalone(root) {
   await writeFile(marker, fingerprint + '\n');
 }
 
-export function openBrowser(url) {
-  let command, args;
-  if (process.platform === 'win32') {
-    command = 'cmd.exe'; args = ['/d', '/s', '/c', `start "" "${url}"`];
-  } else if (process.platform === 'darwin') {
-    command = 'open'; args = [url];
-  } else {
-    command = 'xdg-open'; args = [url];
-  }
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: 'ignore', windowsHide: true });
+export async function openBrowser(url) {
+  const execute = (command, args, env = process.env) => new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: 'ignore', windowsHide: true, env });
     child.once('error', reject);
-    child.once('exit', code => code === 0 ? resolve() : reject(new Error('ブラウザを開けませんでした。')));
+    child.once('exit', code => code === 0 ? resolve() : reject(new Error(`${command} の終了コード：${code}`)));
   });
+  if (process.platform === 'win32') {
+    try {
+      // Explicitly show the associated browser; keep only the helper console hidden.
+      await execute('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+        'try { Start-Process -FilePath $env:KIRINJI_APP_URL -WindowStyle Normal -ErrorAction Stop; exit 0 } catch { exit 1 }'],
+        { ...process.env, KIRINJI_APP_URL: url });
+    } catch (error) {
+      console.warn('標準ブラウザ起動を再試行します：' + error.message);
+      await execute('cmd.exe', ['/d', '/s', '/c', `start "" "${url}"`]);
+    }
+  } else if (process.platform === 'darwin') {
+    await execute('open', [url]);
+  } else {
+    await execute('xdg-open', [url]);
+  }
 }
 
 async function startUnlocked({ root = defaultRoot, port = 3000, browser = true } = {}) {
@@ -103,6 +141,7 @@ async function startUnlocked({ root = defaultRoot, port = 3000, browser = true }
   if (!reused) {
     await prepareDependencies(root);
     await prepareStandalone(root);
+    console.log('アプリのサーバーを起動しています…');
     const { createServer } = await import('vite');
     server = await createServer({
       root,
@@ -132,7 +171,10 @@ async function startUnlocked({ root = defaultRoot, port = 3000, browser = true }
   console.log(`[kirinji] READY ${url}`);
   if (browser) {
     try { await openBrowser(url); }
-    catch { console.log(`ブラウザで ${url} を開いてください。`); }
+    catch (error) {
+      console.error('ブラウザの自動起動に失敗しました：' + error.message);
+      console.log(`ブラウザで ${url} を開いてください。`);
+    }
   }
   return { server, url, reused };
 }
@@ -176,6 +218,7 @@ export async function startApp(options = {}) {
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   const portFlag = process.argv.indexOf('--port');
   try {
+    initializeLog(defaultRoot);
     const result = await startApp({
       port: portFlag === -1 ? 3000 : Number(process.argv[portFlag + 1]),
       browser: !process.argv.includes('--no-browser'),
@@ -197,7 +240,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     }
   } catch (error) {
     console.error('\n起動できませんでした：' + error.message);
-    console.error('別のアプリがポートを使用している場合は終了してから、もう一度起動してください。');
+    console.error('ZIPをすべて展開しているか確認してください。すでに黒い起動画面が開いている場合は、閉じてからもう一度お試しください。');
+    console.error(`起動の記録：${logging || 'startup.log'}`);
+    process.exit(1);
     process.exitCode = 1;
   }
 }

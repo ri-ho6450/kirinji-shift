@@ -3,6 +3,8 @@ setlocal
 chcp 65001 >nul
 cd /d "%~dp0"
 title Kirinji Shift App
+if not exist "%~dp0scripts\start-app.mjs" goto missing_files
+if not exist "%~dp0package-lock.json" goto missing_files
 where node >nul 2>nul
 if not errorlevel 1 goto launch
 if exist "%ProgramFiles%\nodejs\node.exe" (
@@ -27,6 +29,12 @@ echo Please install Node.js LTS from the page that opens, then double-click agai
 start "" "https://nodejs.org/ja/download"
 pause
 exit /b 1
+
+:missing_files
+ echo Please extract ALL files from the ZIP before launching.
+ echo Right-click the ZIP, select Extract All, then launch from the extracted folder.
+ pause
+ exit /b 1
 
 :launch
 node "%~dp0scripts\start-app.mjs"
