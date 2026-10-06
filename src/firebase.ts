@@ -23,7 +23,7 @@ if (import.meta.env.VITE_FIRESTORE_EMULATOR_HOST) {
 }
 export {
   collection, query, where, doc, setDoc, deleteDoc, updateDoc,
-  getDoc, getDocs, writeBatch, orderBy, limit,
+  getDoc, getDocs, getDocsFromServer, waitForPendingWrites, writeBatch, orderBy, limit,
 } from 'firebase/firestore';
 export type { User } from 'firebase/auth';
 

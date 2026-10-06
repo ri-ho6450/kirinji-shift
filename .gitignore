@@ -11,3 +11,5 @@ coverage/
 /kirinji_shift_app.*
 /playwright-report/
 /test-results/
+
+/.kirinji-launcher/

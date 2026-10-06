@@ -53,3 +53,60 @@ test('shift/task edits sync between independent browsers and survive reload', as
     await Promise.all(contexts.map(context => context.close()));
   }
 });
+
+test('compensatory leave is reassigned only when shift edit mode is released', async ({ page, request }) => {
+  test.skip(process.env.KIRINJI_SYNC_TEST !== '1', 'Requires the isolated emulator.');
+  await request.delete(`${emulator}/emulator/v1/projects/demo-kirinji/databases/(default)/documents`);
+  const put = async (path: string, values: Record<string, string | boolean | number>) => {
+    const fields = Object.fromEntries(Object.entries(values).map(([key, value]) => [key,
+      typeof value === 'boolean' ? { booleanValue: value } : typeof value === 'number' ? { integerValue: String(value) } : { stringValue: value },
+    ]));
+    const response = await request.patch(`${database}/${path}`, { data: { fields } });
+    expect(response.ok()).toBeTruthy();
+  };
+  await put('staff/1', { id: '1', name: 'テスト担当者', order: 0 });
+  for (const date of ['2026-09-22', '2026-09-23']) {
+    await put(`holidays/${date}`, { date, isHoliday: true });
+    await put(`shifts/${date}_1`, { date, staffId: '1', code: 'MO', locked: false });
+  }
+  await put('shifts/2026-09-24_1', { date: '2026-09-24', staffId: '1', code: '振休', compensatorySourceDate: '2026-09-22' });
+  await put('shifts/2026-09-25_1', { date: '2026-09-25', staffId: '1', code: '振休', compensatorySourceDate: '2026-09-23', locked: true });
+  await page.clock.setFixedTime(new Date('2026-10-06T03:00:00Z'));
+  await page.goto('/');
+  await expect(page.getByRole('status')).toHaveText('Firebase 同期済み');
+  const begin = async () => {
+    await page.getByRole('button', { name: 'シフト編集', exact: true }).click();
+    await page.locator('input[type=password]').fill('ks1311');
+    await page.getByRole('button', { name: '認証', exact: true }).click();
+  };
+  const row = page.locator('table').first().locator('tbody tr').filter({ hasText: 'テスト担当者' }).first();
+  const source = async (date: string) => {
+    const response = await request.get(`${database}/shifts/${date}_1`);
+    if (response.status() === 404) return null;
+    expect(response.ok()).toBeTruthy();
+    return (await response.json()).fields.compensatorySourceDate?.stringValue || '';
+  };
+  const release = async () => {
+    await page.getByRole('button', { name: '編集モード解除', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'シフト編集', exact: true })).toBeVisible();
+  };
+  await begin();
+  await row.locator('td').nth(4).locator('select').selectOption(''); // September 24
+  await expect(page.getByRole('status')).toHaveText('Firebase 同期済み');
+  expect(await source('2026-09-25')).toBe('2026-09-23');
+  await release();
+  expect(await source('2026-09-25')).toBe('2026-09-22');
+  await begin();
+  await row.locator('td').nth(4).locator('select').selectOption('振休');
+  await expect(page.getByRole('status')).toHaveText('Firebase 同期済み');
+  await expect.poll(() => source('2026-09-24')).toBe('');
+  expect(await source('2026-09-25')).toBe('2026-09-22');
+  await release();
+  expect(await source('2026-09-24')).toBe('2026-09-22');
+  expect(await source('2026-09-25')).toBe('2026-09-23');
+  const unchanged = await request.get(`${database}/shifts/2026-09-25_1`);
+  expect((await unchanged.json()).fields.locked.booleanValue).toBe(true);
+  await page.reload();
+  await expect(page.getByRole('status')).toHaveText('Firebase 同期済み');
+  expect(await source('2026-09-25')).toBe('2026-09-23');
+});

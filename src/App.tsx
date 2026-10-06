@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { calculateCompensatoryAssignments } from './compensatory';
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { 
   Calendar, 
@@ -54,6 +55,8 @@ import {
   updateDoc,
   getDoc,
   getDocs,
+  getDocsFromServer,
+  waitForPendingWrites,
   writeBatch,
   orderBy,
   limit,
@@ -61,7 +64,7 @@ import {
 } from './firebase';
 
 // --- Types ---
-import { Staff, ShiftCode, TaskCode, AppSettings, ShiftData, TaskData, MemoData, StaffNoteData, DetailedMemoData, ShiftPattern, HolidayData, TaskPattern, CompensatoryData } from './types';
+import { Staff, ShiftCode, TaskCode, AppSettings, ShiftData, TaskData, MemoData, StaffNoteData, DetailedMemoData, ShiftPattern, HolidayData, TaskPattern, CompensatoryData, ShiftRecord } from './types';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -968,6 +971,8 @@ export default function App() {
   const [selectedStaffId, setSelectedStaffId] = useState<string | null>(null);
   const [selectedDate, setSelectedDate] = useState<string>(formatDate(new Date()));
   const [isEditMode, setIsEditMode] = useState(false);
+  const [isRecalculating, setIsRecalculating] = useState(false);
+  const shiftsEditedRef = React.useRef(false);
   const [authModal, setAuthModal] = useState<{ isOpen: boolean, target: 'edit' | 'settings' | null }>({ isOpen: false, target: null });
   const [isPatternDropdownOpen, setIsPatternDropdownOpen] = useState(false);
   const [selectedPatternId, setSelectedPatternId] = useState<string | null>(null);
@@ -1148,368 +1153,81 @@ export default function App() {
     setAuthModal({ isOpen: false, target: null });
   }, [authModal.target]);
 
-  const toggleEditMode = useCallback(() => {
-    if (isEditMode) setIsEditMode(false);
-    else setAuthModal({ isOpen: true, target: 'edit' });
-  }, [isEditMode]);
-
-  // 振休管理用ヘルパー: スタッフの全シフトおよび休日設定の取得
-  const fetchStaffCompensatoryContext = useCallback(async (staffId: string): Promise<{
-    staffShiftsMap: Record<string, { code: string; compensatorySourceDate?: string }>;
-    allHolidaysMap: Record<string, boolean>;
-  }> => {
-    const staffShiftsMap: Record<string, { code: string; compensatorySourceDate?: string }> = {};
-    const allHolidaysMap: Record<string, boolean> = { ...holidays };
-
-    try {
-      const [shiftsSnap, holidaysSnap] = await Promise.all([
-        getDocs(query(collection(db, 'shifts'), where('staffId', '==', staffId))),
-        getDocs(collection(db, 'holidays'))
-      ]);
-      shiftsSnap.docs.forEach(d => {
-        const data = d.data();
-        staffShiftsMap[data.date] = {
-          code: data.code || '',
-          compensatorySourceDate: data.compensatorySourceDate || ''
-        };
-      });
-      holidaysSnap.docs.forEach(d => {
-        const data = d.data();
-        allHolidaysMap[data.date] = !!data.isHoliday;
-      });
-    } catch (err) {
-      console.error('Error fetching staff compensatory context:', err);
-    }
-
-    // 最新のローカル状態をマージ
-    for (const [d, staffMap] of Object.entries(shifts)) {
-      if (staffMap[staffId] !== undefined) {
-        if (!staffShiftsMap[d]) staffShiftsMap[d] = { code: staffMap[staffId] };
-        else staffShiftsMap[d].code = staffMap[staffId];
-      }
-    }
-    for (const [d, staffComp] of Object.entries(compensatoryDates)) {
-      if (staffComp[staffId] !== undefined) {
-        if (!staffShiftsMap[d]) staffShiftsMap[d] = { code: '振休', compensatorySourceDate: staffComp[staffId] };
-        else staffShiftsMap[d].compensatorySourceDate = staffComp[staffId];
-      }
-    }
-
-    return { staffShiftsMap, allHolidaysMap };
-  }, [holidays, shifts, compensatoryDates]);
-
-  // 優先順位に基づき振休充当元の休日出勤日を自動選定
-  // スタッフ別制約:
-  // - 田中: 2026/9/1から実装。2026/8/31以前分は割り当てない
-  // - 高畠: 2026/8/3に2026/8/1割当てを起点とする。2026/8/1以降の休日設定日を振休に割り当てる
-  // - 三浦: 2026/8/5に2026/8/2割当てを起点とする。2026/8/1以降の休日設定日を振休に割り当てる
-  // 優先順位:
-  // 1. 振休日以前の日付にある、未消化の休日出勤日の中で最も古い日
-  // 2. 上記が存在しない場合、振休日より後の日付にある、未割当の休日出勤予定日の中で最も近い日
-  const selectCompensatorySourceDate = useCallback((
-    targetDate: string,
-    staffId: string,
-    staffShiftsMap: Record<string, { code: string; compensatorySourceDate?: string }>,
-    holidayMap: Record<string, boolean>,
-    excludeDate?: string
-  ): { sourceDate: string | null; isAdvance: boolean; message?: string } => {
-    const person = staff.find(s => s.id === staffId);
-    const staffName = person?.name || '';
-    const isTanaka = staffName.includes('田中');
-    const isTakabatake = staffName.includes('高畠');
-    const isMiura = staffName.includes('三浦');
-
-    // 田中: 2026/9/1からこの仕様を実装。2026/8/31以前分は割り当てない。
-    if (isTanaka && targetDate < '2026-09-01') {
-      return {
-        sourceDate: null,
-        isAdvance: false,
-        message: '田中さんは2026年9月1日以降から振休仕様が適用されます（2026/8/31以前分は割り当て対象外です）。'
-      };
-    }
-
-    // 高畠の起点: 2026/8/3 に 2026/8/1 を割り当て（2026/8/3より前の振休は対象外）
-    if (isTakabatake && targetDate < '2026-08-03') {
-      return { sourceDate: null, isAdvance: false, message: '高畠さんは2026年8月3日以降から振休仕様が適用されます。' };
-    }
-    if (isTakabatake && targetDate === '2026-08-03') {
-      return { sourceDate: '2026-08-01', isAdvance: false };
-    }
-
-    // 三浦の起点: 2026/8/5 に 2026/8/2 を割り当て（2026/8/5より前の振休は対象外）
-    if (isMiura && targetDate < '2026-08-05') {
-      return { sourceDate: null, isAdvance: false, message: '三浦さんは2026年8月5日以降から振休仕様が適用されます。' };
-    }
-    if (isMiura && targetDate === '2026-08-05') {
-      return { sourceDate: '2026-08-02', isAdvance: false };
-    }
-
-    // 休日出勤日の有効開始日
-    // - 田中: 2026-09-01以降（2026/8/31以前分は割り当てない）
-    // - 三浦: 2026-08-02以降（三浦の起点は8/2。8/1は高畠の起点のため対象外）
-    // - 高畠・その他: 2026-08-01以降
-    const minHolidaySourceDate = isTanaka ? '2026-09-01' : (isMiura ? '2026-08-02' : '2026-08-01');
-
-    // 休日設定かつMO/SHの勤務日（有効開始日以降）
-    const holidayWorkDates: string[] = [];
-    for (const [d, info] of Object.entries(staffShiftsMap)) {
-      if (d >= minHolidaySourceDate && holidayMap[d] && (info.code === 'MO' || info.code === 'SH')) {
-        holidayWorkDates.push(d);
-      }
-    }
-
-    // 他の振休で使用済みの取得元
-    const usedDates = new Set<string>();
-
-    // 高畠の起点（2026-08-01）は2026-08-03以外では使用済みとして予約
-    if (isTakabatake && targetDate !== '2026-08-03') {
-      usedDates.add('2026-08-01');
-    }
-    // 三浦の起点（2026-08-02）は2026-08-05以外では使用済みとして予約
-    if (isMiura && targetDate !== '2026-08-05') {
-      usedDates.add('2026-08-02');
-    }
-
-    for (const [d, info] of Object.entries(staffShiftsMap)) {
-      if (d !== excludeDate && (info.code === '振休' || info.code.startsWith('振休'))) {
-        if (info.compensatorySourceDate) {
-          usedDates.add(info.compensatorySourceDate);
-        }
-      }
-    }
-
-    // 未消化・未割当の休日出勤日
-    const availableDates = holidayWorkDates.filter(d => !usedDates.has(d));
-
-    // 優先度1: targetDate以前（過去・当日）の最も古い日
-    const pastDates = availableDates.filter(d => d <= targetDate).sort();
-    if (pastDates.length > 0) {
-      return { sourceDate: pastDates[0], isAdvance: false };
-    }
-
-    // 優先度2: targetDateより後（未来）の最も近い日（前借り）
-    const futureDates = availableDates.filter(d => d > targetDate).sort();
-    if (futureDates.length > 0) {
-      return { sourceDate: futureDates[0], isAdvance: true };
-    }
-
-    return { sourceDate: null, isAdvance: false };
-  }, [staff]);
-
-  const updateShift = useCallback(async (date: string, staffId: string, code: string) => {
-    const currentCode = shifts[date]?.[staffId] || '';
-    const currentCompDate = compensatoryDates[date]?.[staffId] || '';
-
-    // A. 勤務区分として「振休」を選択した場合
-    if (code === '振休') {
-      const person = staff.find(s => s.id === staffId);
-      const staffName = person?.name || '';
-      const isTanaka = staffName.includes('田中');
-
-      if (isTanaka && date < '2026-09-01') {
-        showAlert(
-          '振休仕様の適用期間外',
-          '田中さんは2026年9月1日以降から振休仕様が適用されます。\n2026/8/31以前分は割り当て対象外です。'
-        );
-        return;
-      }
-
-      if ((currentCode === '振休' || currentCode.startsWith('振休')) && currentCompDate) {
-        // すでに紐付け済みの振休が再度選択された場合は維持
-        return;
-      }
-
-      const { staffShiftsMap, allHolidaysMap } = await fetchStaffCompensatoryContext(staffId);
-      const { sourceDate, isAdvance, message } = selectCompensatorySourceDate(date, staffId, staffShiftsMap, allHolidaysMap, date);
-
-      if (!sourceDate) {
-        showAlert(
-          '振休に充当できる休日出勤がありません',
-          message || '過去にも未来にも未割当の休日出勤日（休日設定＋MO/SH）が存在しません。\n振休を設定するには、先に休日出勤日または休日出勤予定日を登録してください。'
-        );
-        return;
-      }
-
-      const docId = `${date}_${staffId}`;
-      await setDoc(doc(db, 'shifts', docId), {
-        date,
-        staffId,
-        code: '振休',
-        shiftType: '振休',
-        compensatorySourceDate: sourceDate
-      }, { merge: true });
-
-      setShifts(prev => ({
-        ...prev,
-        [date]: { ...(prev[date] || {}), [staffId]: '振休' }
-      }));
-      setCompensatoryDates(prev => ({
-        ...prev,
-        [date]: { ...(prev[date] || {}), [staffId]: sourceDate }
-      }));
-
-      const formattedSrc = `${parseInt(sourceDate.split('-')[1], 10)}/${parseInt(sourceDate.split('-')[2], 10)}`;
-      if (isAdvance) {
-        showToast(`前借り振休を設定しました（振替予定日: ${formattedSrc}）`);
-      } else {
-        showToast(`振休を設定しました（振替元: ${formattedSrc}）`);
-      }
+  const toggleEditMode = useCallback(async () => {
+    if (!isEditMode) {
+      setAuthModal({ isOpen: true, target: 'edit' });
       return;
     }
-
-    // B. 休日出勤日側（休日設定＋MO/SH）が変更または削除される場合
-    const isCurrentHolidayWork = holidays[date] && (currentCode === 'MO' || currentCode === 'SH');
-    const isNewHolidayWork = holidays[date] && (code === 'MO' || code === 'SH');
-
-    if (isCurrentHolidayWork && !isNewHolidayWork) {
-      const { staffShiftsMap, allHolidaysMap } = await fetchStaffCompensatoryContext(staffId);
-      
-      // この休日出勤日を compensatorySourceDate として使用している振休を探索
-      const linkedFurikyuDates: string[] = [];
-      for (const [d, info] of Object.entries(staffShiftsMap) as [string, { code: string; compensatorySourceDate?: string }][]) {
-        if (info.compensatorySourceDate === date) {
-          linkedFurikyuDates.push(d);
-        }
-      }
-
-      if (linkedFurikyuDates.length > 0) {
-        const furikyuStr = linkedFurikyuDates.map(d => `${parseInt(d.split('-')[1], 10)}/${parseInt(d.split('-')[2], 10)}`).join('、');
-        const dateDisplay = `${parseInt(date.split('-')[1], 10)}/${parseInt(date.split('-')[2], 10)}`;
-
-        showConfirm(
-          '休日出勤の変更確認',
-          `この休日出勤日（${dateDisplay}）は振休（${furikyuStr}）に使用されています。\n変更すると、振休の紐付けが見直されますが、変更しますか？`,
-          async () => {
-            // シフト更新を保存
-            const docId = `${date}_${staffId}`;
-            if (!code) {
-              await deleteDoc(doc(db, 'shifts', docId));
-            } else {
-              await setDoc(doc(db, 'shifts', docId), { date, staffId, code }, { merge: false });
-            }
-
-            // 更新後の staffShiftsMap
-            const updatedMap = { ...staffShiftsMap };
-            if (!code) delete updatedMap[date];
-            else updatedMap[date] = { code };
-
-            const batch = writeBatch(db);
-            const advanceUnlinkedList: string[] = [];
-            const regularUnmatchedList: string[] = [];
-
-            // 影響を受ける各振休について処理
-            for (const fDate of linkedFurikyuDates) {
-              const isAdvance = fDate < date; // 振休が休日出勤予定日より前（前借り）
-              if (isAdvance) {
-                // 前借りの休日出勤予定が変更された場合：
-                // 自動で別の日へ勝手に付け替えず、ユーザーが確認できるように未紐付けにする
-                batch.set(doc(db, 'shifts', `${fDate}_${staffId}`), {
-                  date: fDate,
-                  staffId,
-                  code: '振休',
-                  shiftType: '振休',
-                  compensatorySourceDate: ''
-                }, { merge: true });
-                advanceUnlinkedList.push(fDate);
-              } else {
-                // 通常の過去休日出勤の場合は再割当てを試みる
-                const { sourceDate } = selectCompensatorySourceDate(fDate, staffId, updatedMap, allHolidaysMap, fDate);
-                if (sourceDate) {
-                  updatedMap[fDate] = { code: '振休', compensatorySourceDate: sourceDate };
-                  batch.set(doc(db, 'shifts', `${fDate}_${staffId}`), {
-                    date: fDate,
-                    staffId,
-                    code: '振休',
-                    shiftType: '振休',
-                    compensatorySourceDate: sourceDate
-                  }, { merge: true });
-                } else {
-                  batch.set(doc(db, 'shifts', `${fDate}_${staffId}`), {
-                    date: fDate,
-                    staffId,
-                    code: '振休',
-                    shiftType: '振休',
-                    compensatorySourceDate: ''
-                  }, { merge: true });
-                  regularUnmatchedList.push(fDate);
-                }
-              }
-            }
-
-            await batch.commit();
-
-            // ローカル状態反映
-            setShifts(prev => {
-              const next = { ...prev };
-              if (!code) {
-                if (next[date]) {
-                  const s = { ...next[date] };
-                  delete s[staffId];
-                  next[date] = s;
-                }
-              } else {
-                next[date] = { ...(next[date] || {}), [staffId]: code };
-              }
-              return next;
-            });
-
-            // 警告メッセージの表示
-            if (advanceUnlinkedList.length > 0) {
-              const fStr = advanceUnlinkedList.map(d => `${parseInt(d.split('-')[1], 10)}/${parseInt(d.split('-')[2], 10)}`).join('、');
-              showAlert(
-                '前借り振休の確認',
-                `「${fStr}の振休に紐付いていた${dateDisplay}の休日出勤予定が変更されています。振休の割当てを確認してください。」`
-              );
-            } else if (regularUnmatchedList.length > 0) {
-              const rStr = regularUnmatchedList.map(d => `${parseInt(d.split('-')[1], 10)}/${parseInt(d.split('-')[2], 10)}`).join('、');
-              showAlert(
-                '振休の再割当て結果',
-                `休日出勤日の変更に伴い振休の再割当てを行いましたが、${rStr}の振休に充当できる休日出勤が不足しています。振休の割当てを確認してください。`
-              );
-            } else {
-              showToast('シフトを変更し、振休を再割当てしました');
-            }
-          }
-        );
-        return;
-      }
+    if (isRecalculating) return;
+    if (!shiftsEditedRef.current) {
+      setIsEditMode(false);
+      return;
     }
-
-    // C. 振休を別の勤務区分（または空）へ変更・解除する場合
-    const docId = `${date}_${staffId}`;
-    if (!code) {
-      await deleteDoc(doc(db, 'shifts', docId));
-      setShifts(prev => {
-        const next = { ...prev };
-        if (next[date]) {
-          const s = { ...next[date] };
-          delete s[staffId];
-          next[date] = s;
-        }
-        return next;
+    setIsRecalculating(true);
+    let timeout: ReturnType<typeof setTimeout>;
+    try {
+      // Reconciliation needs a complete current snapshot, not a partial offline cache.
+      await Promise.race([
+        waitForPendingWrites(db),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error('シフトの送信が完了していません。接続を確認して再度お試しください。')), 15000);
+        }),
+      ]);
+      clearTimeout(timeout!);
+      const [staffSnapshot, shiftSnapshot, holidaySnapshot] = await Promise.all([
+        getDocsFromServer(collection(db, 'staff')),
+        getDocsFromServer(collection(db, 'shifts')),
+        getDocsFromServer(collection(db, 'holidays')),
+      ]);
+      const allStaff = staffSnapshot.empty ? INITIAL_STAFF : staffSnapshot.docs.map(record => record.data() as Staff);
+      const allShifts = shiftSnapshot.docs.map(record => ({ ...record.data(), id: record.id }) as ShiftRecord & { id: string });
+      const allHolidays: Record<string, boolean> = {};
+      holidaySnapshot.docs.forEach(record => {
+        const data = record.data();
+        allHolidays[data.date] = !!data.isHoliday;
       });
-    } else {
-      await setDoc(doc(db, 'shifts', docId), { date, staffId, code }, { merge: false });
-      setShifts(prev => ({
-        ...prev,
-        [date]: { ...(prev[date] || {}), [staffId]: code }
-      }));
+      const { changes, unmatched } = calculateCompensatoryAssignments(allStaff, allShifts, allHolidays);
+      // Keep batches below Firestore's 500-write limit; preserve shift metadata with merge.
+      for (let offset = 0; offset < changes.length; offset += 450) {
+        const batch = writeBatch(db);
+        changes.slice(offset, offset + 450).forEach(({ record, sourceDate }) => {
+          batch.update(doc(db, 'shifts', record.id), { compensatorySourceDate: sourceDate });
+        });
+        await batch.commit();
+      }
+      shiftsEditedRef.current = false;
+      setIsEditMode(false);
+      if (unmatched.length) {
+        const details = unmatched.map(item => `${allStaff.find(person => person.id === item.staffId)?.name || item.staffId}：${item.date}`).join('\n');
+        showAlert('振休の自動割当を更新しました', `充当できる休日出勤が不足している振休は未割当になっています。\n${details}`);
+      } else {
+        showToast('振休の自動割当を更新しました');
+      }
+    } catch (error) {
+      console.error('Compensatory reconciliation failed:', error);
+      showAlert('振休の再計算が完了していません', 'シフトの変更内容は保持しています。インターネット接続とFirebaseのアクセス権を確認し、編集モード解除をもう一度押してください。');
+    } finally {
+      clearTimeout(timeout!);
+      setIsRecalculating(false);
     }
+  }, [isEditMode, isRecalculating, showAlert, showToast]);
 
-    // 振休が解除された場合、紐付いていた休日出勤日を未消化・未割当に戻す
-    if (currentCode === '振休' || currentCode.startsWith('振休')) {
-      setCompensatoryDates(prev => {
-        const next = { ...prev };
-        if (next[date]) {
-          const s = { ...next[date] };
-          delete s[staffId];
-          next[date] = s;
-        }
-        return next;
-      });
-      showToast('シフトを更新しました（紐付いていた休日出勤日は未消化に戻りました）');
+  const updateShift = useCallback(async (date: string, staffId: string, code: string) => {
+    if (isRecalculating || shifts[date]?.[staffId] === code) return;
+    shiftsEditedRef.current = true;
+    const ref = doc(db, 'shifts', `${date}_${staffId}`);
+    try {
+      if (!code) await deleteDoc(ref);
+      else await setDoc(ref, {
+        date, staffId, code,
+        shiftType: code === '振休' ? '振休' : '',
+        compensatorySourceDate: code === '振休' ? compensatoryDates[date]?.[staffId] || '' : '',
+      }, { merge: true });
+    } catch (error) {
+      console.error('Shift save failed:', error);
+      showAlert('シフトの保存に失敗しました', '接続とアクセス権を確認して、シフトを選択し直してください。');
     }
-  }, [shifts, holidays, compensatoryDates, staff, fetchStaffCompensatoryContext, selectCompensatorySourceDate, showConfirm, showAlert, showToast]);
+  }, [isRecalculating, shifts, compensatoryDates, showAlert]);
 
   const updateTask = useCallback(async (date: string, staffId: string, time: string, code: string, type: 'plan' | 'result') => {
     const docId = `${date}_${staffId}_${time}`;
@@ -1600,106 +1318,17 @@ export default function App() {
   }, []);
 
   const updateHoliday = useCallback(async (date: string, isHoliday: boolean) => {
-    if (!isHoliday) {
-      // 休日設定を解除する場合、この日を compensatorySourceDate として紐付けている振休があるか確認
-      const affectedStaffMap: Record<string, string[]> = {}; // staffId -> furikyuDates
-      for (const [fDate, staffMap] of Object.entries(compensatoryDates)) {
-        for (const [sId, srcDate] of Object.entries(staffMap)) {
-          if (srcDate === date) {
-            if (!affectedStaffMap[sId]) affectedStaffMap[sId] = [];
-            affectedStaffMap[sId].push(fDate);
-          }
-        }
-      }
-
-      const affectedStaffIds = Object.keys(affectedStaffMap);
-      if (affectedStaffIds.length > 0) {
-        const affectedNames = staff.filter(s => affectedStaffIds.includes(s.id)).map(s => s.name).join('、');
-        const dateDisplay = `${parseInt(date.split('-')[1], 10)}/${parseInt(date.split('-')[2], 10)}`;
-
-        showConfirm(
-          '休日設定の解除確認',
-          `この日（${dateDisplay}）は以下のスタッフの振休取得元として使用されています：\n【${affectedNames}】\n\n休日設定を解除すると振休との紐付けが無効になりますが、解除しますか？`,
-          async () => {
-            await deleteDoc(doc(db, 'holidays', date));
-            setHolidays(prev => ({ ...prev, [date]: false }));
-
-            const updatedHolidays = { ...holidays, [date]: false };
-            const advanceAlerts: string[] = [];
-            const regularAlerts: string[] = [];
-
-            for (const sId of affectedStaffIds) {
-              const { staffShiftsMap } = await fetchStaffCompensatoryContext(sId);
-              const furikyuList = affectedStaffMap[sId] || [];
-              const batch = writeBatch(db);
-
-              for (const fDate of furikyuList) {
-                const isAdvance = fDate < date; // 前借り振休
-                if (isAdvance) {
-                  // 前借り振休は自動で別の日へ勝手に付け替えず、ユーザーが確認できるように未紐付けにする
-                  batch.set(doc(db, 'shifts', `${fDate}_${sId}`), {
-                    date: fDate,
-                    staffId: sId,
-                    code: '振休',
-                    shiftType: '振休',
-                    compensatorySourceDate: ''
-                  }, { merge: true });
-                  const fStr = `${parseInt(fDate.split('-')[1], 10)}/${parseInt(fDate.split('-')[2], 10)}`;
-                  advanceAlerts.push(`「${fStr}の振休に紐付いていた${dateDisplay}の休日出勤予定が変更されています。振休の割当てを確認してください。」`);
-                } else {
-                  // 通常の過去休日出勤の場合は再割当てを試みる
-                  const { sourceDate } = selectCompensatorySourceDate(fDate, sId, staffShiftsMap, updatedHolidays, fDate);
-                  if (sourceDate) {
-                    staffShiftsMap[fDate] = { code: '振休', compensatorySourceDate: sourceDate };
-                    batch.set(doc(db, 'shifts', `${fDate}_${sId}`), {
-                      date: fDate,
-                      staffId: sId,
-                      code: '振休',
-                      shiftType: '振休',
-                      compensatorySourceDate: sourceDate
-                    }, { merge: true });
-                  } else {
-                    batch.set(doc(db, 'shifts', `${fDate}_${sId}`), {
-                      date: fDate,
-                      staffId: sId,
-                      code: '振休',
-                      shiftType: '振休',
-                      compensatorySourceDate: ''
-                    }, { merge: true });
-                    const fStr = `${parseInt(fDate.split('-')[1], 10)}/${parseInt(fDate.split('-')[2], 10)}`;
-                    const sName = staff.find(s => s.id === sId)?.name || 'スタッフ';
-                    regularAlerts.push(`${sName}（${fStr}の振休）`);
-                  }
-                }
-              }
-
-              await batch.commit();
-            }
-
-            if (advanceAlerts.length > 0) {
-              showAlert('前借り振休の確認', advanceAlerts.join('\n'));
-            } else if (regularAlerts.length > 0) {
-              showAlert(
-                '振休の再割当て結果',
-                `休日設定の解除に伴い、以下の振休に充当できる休日出勤が不足しています：\n${regularAlerts.join('、')}\n振休の割当てを確認してください。`
-              );
-            } else {
-              showToast('休日設定を解除し、振休を再割当てしました');
-            }
-          }
-        );
-        return;
-      }
-
-      await deleteDoc(doc(db, 'holidays', date));
-      setHolidays(prev => ({ ...prev, [date]: false }));
-    } else {
-      await setDoc(doc(db, 'holidays', date), { date, isHoliday: true });
-      setHolidays(prev => ({ ...prev, [date]: true }));
+    if (isRecalculating) return;
+    shiftsEditedRef.current = true;
+    try {
+      if (isHoliday) await setDoc(doc(db, 'holidays', date), { date, isHoliday: true });
+      else await deleteDoc(doc(db, 'holidays', date));
+    } catch (error) {
+      console.error('Holiday save failed:', error);
+      showAlert('休日設定の保存に失敗しました', '接続とアクセス権を確認して、休日設定をやり直してください。');
     }
-  }, [holidays, compensatoryDates, staff, fetchStaffCompensatoryContext, selectCompensatorySourceDate, showConfirm, showAlert, showToast]);
+  }, [isRecalculating, showAlert]);
 
-  // 高畠・三浦の振休起点データの初期設定（2026/8/1以降の起点を確立）
   const updateShiftLock = useCallback(async (date: string, staffId: string, isLocked: boolean) => {
     const docId = `${date}_${staffId}`;
     await setDoc(doc(db, 'shifts', docId), { locked: isLocked }, { merge: true });
@@ -1829,6 +1458,7 @@ export default function App() {
         }
         
         await batch.commit();
+        shiftsEditedRef.current = true;
         showToast('パターンを反映しました');
       }
     );
@@ -2108,6 +1738,7 @@ export default function App() {
           </button>
           <button 
             onClick={toggleEditMode}
+            disabled={isRecalculating}
             className={cn(
               "px-4 py-2 rounded-md font-bold transition-all text-sm border",
               isEditMode 
@@ -2115,7 +1746,7 @@ export default function App() {
                 : "bg-transparent text-white border-white/30 hover:bg-white/10"
             )}
           >
-            {isEditMode ? '編集モード解除' : 'シフト編集'}
+            {isRecalculating ? '振休を再計算中…' : isEditMode ? '編集モード解除' : 'シフト編集'}
           </button>
           <button 
             onClick={openSettings}
@@ -2163,7 +1794,7 @@ export default function App() {
             <ShiftGridTable 
               dates={periodDates}
               title={`${periodDates[periodDates.length - 1].getFullYear()}年 ${periodDates[periodDates.length - 1].getMonth() + 1}月度 (${periodDates[0].getMonth() + 1}/${periodDates[0].getDate()} 〜 ${periodDates[periodDates.length - 1].getMonth() + 1}/${periodDates[periodDates.length - 1].getDate()})`}
-              isEditMode={isEditMode}
+              isEditMode={isEditMode && !isRecalculating}
               shifts={shifts}
               memos={memos}
               holidays={holidays}
@@ -2190,7 +1821,7 @@ export default function App() {
             <ShiftGridTable 
               dates={nextPeriod}
               title={`${nextPeriod[nextPeriod.length - 1].getFullYear()}年 ${nextPeriod[nextPeriod.length - 1].getMonth() + 1}月度 (${nextPeriod[0].getMonth() + 1}/${nextPeriod[0].getDate()} 〜 ${nextPeriod[nextPeriod.length - 1].getMonth() + 1}/${nextPeriod[nextPeriod.length - 1].getDate()})`}
-              isEditMode={isEditMode}
+              isEditMode={isEditMode && !isRecalculating}
               shifts={shifts}
               memos={memos}
               holidays={holidays}
