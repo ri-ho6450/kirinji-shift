@@ -1,0 +1,127 @@
+{
+  "entities": {
+    "staff": {
+      "title": "Staff Member",
+      "description": "Information about a staff member",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "order": { "type": "number" }
+      },
+      "required": ["id", "name"]
+    },
+    "shift": {
+      "title": "Shift",
+      "description": "A shift assignment for a person on a specific date",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string" },
+        "staffId": { "type": "string" },
+        "code": { "type": "string" },
+        "shiftType": { "type": "string" },
+        "compensatorySourceDate": { "type": "string" }
+      },
+      "required": ["date", "staffId", "code"]
+    },
+    "task": {
+      "title": "Task",
+      "description": "A task assignment for a person at a specific time",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string" },
+        "staffId": { "type": "string" },
+        "time": { "type": "string" },
+        "plan": { "type": "string" },
+        "result": { "type": "string" }
+      },
+      "required": ["date", "staffId", "time"]
+    },
+    "staffNote": {
+      "title": "Staff Note",
+      "description": "Linked notes for a staff member on a specific date",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string" },
+        "staffId": { "type": "string" },
+        "text": { "type": "string" }
+      },
+      "required": ["date", "staffId", "text"]
+    },
+    "detailedMemo": {
+      "title": "Detailed Memo",
+      "description": "Private detailed notes for a staff member on a specific date",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string" },
+        "staffId": { "type": "string" },
+        "text": { "type": "string" }
+      },
+      "required": ["date", "staffId", "text"]
+    },
+    "holiday": {
+      "title": "Holiday Setting",
+      "description": "Setting a specific date as a holiday",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string" },
+        "isHoliday": { "type": "boolean" }
+      },
+      "required": ["date", "isHoliday"]
+    },
+    "memo": {
+      "title": "Daily Memo",
+      "description": "A text memo for a specific date",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string" },
+        "text": { "type": "string" }
+      },
+      "required": ["date", "text"]
+    },
+    "appConfig": {
+      "title": "Application Configuration",
+      "description": "Global settings like shift and task abbreviations",
+      "type": "object",
+      "properties": {
+        "shiftAbbreviations": { "type": "array", "items": { "type": "string" } },
+        "taskAbbreviations": { "type": "array", "items": { "type": "string" } },
+        "shiftPattern": { "type": "object" }
+      }
+    }
+  },
+  "firestore": {
+    "staff": {
+      "schema": "staff",
+      "description": "Collection of staff members"
+    },
+    "shifts": {
+      "schema": "shift",
+      "description": "Collection of all shift assignments"
+    },
+    "tasks": {
+      "schema": "task",
+      "description": "Collection of all task assignments"
+    },
+    "memos": {
+      "schema": "memo",
+      "description": "Collection of daily memos"
+    },
+    "staff_notes": {
+      "schema": "staffNote",
+      "description": "Collection of linked staff notes"
+    },
+    "detailed_memos": {
+      "schema": "detailedMemo",
+      "description": "Collection of private detailed memos"
+    },
+    "holidays": {
+      "schema": "holiday",
+      "description": "Collection of holiday settings"
+    },
+    "config/main": {
+      "schema": "appConfig",
+      "description": "Global configuration document"
+    }
+  }
+}
