@@ -3,6 +3,7 @@ import {
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
   connectFirestoreEmulator, onSnapshot as firestoreOnSnapshot,
 } from 'firebase/firestore';
+import { getAuth, connectAuthEmulator } from 'firebase/auth';
 import bundledConfig from '../firebase-applet-config.json';
 
 // Firebase web configuration is public project metadata, not a server credential.
@@ -11,6 +12,13 @@ const config = import.meta.env.VITE_FIREBASE_CONFIG
   ? JSON.parse(import.meta.env.VITE_FIREBASE_CONFIG)
   : bundledConfig;
 const app = initializeApp(config);
+export const auth = getAuth(app);
+export const allowedUid = config.projectId.startsWith('demo-') ? 'kirinji-test-user' : 'W2LqrexzUaUABKRAAf9lqIEj2NB3';
+export const demoUiMode = config.projectId.startsWith('demo-') && import.meta.env.VITE_DEMO_UI === '1';
+if (import.meta.env.VITE_AUTH_EMULATOR_HOST) {
+  if (!config.projectId.startsWith('demo-')) throw new Error('認証エミュレーターではdemo-プロジェクトを使用してください。');
+  connectAuthEmulator(auth, `http://${import.meta.env.VITE_AUTH_EMULATOR_HOST}`, { disableWarnings: true });
+}
 export const db = initializeFirestore(app, {
   localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
 }, config.firestoreDatabaseId || '(default)');

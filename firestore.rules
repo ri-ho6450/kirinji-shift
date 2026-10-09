@@ -1,51 +1,9 @@
-// ===============================================================
-// Assumed Data Model
-// ===============================================================
-//
-// Collection: staff
-// - id: string (required)
-// - name: string (required) 1-50 chars
-// - order: number
-//
-// Collection: shifts
-// - id: string (date_staffId)
-// - date: string (required) YYYY-MM-DD
-// - staffId: string (required)
-// - code: string (required)
-//
-// Collection: tasks
-// - id: string (date_staffId_time)
-// - date: string (required) YYYY-MM-DD
-// - staffId: string (required)
-// - time: string (required) HH:MM
-// - code: string (required)
-//
-// Collection: memos
-// - id: string (date)
-// - date: string (required) YYYY-MM-DD
-// - text: string (required)
-//
-// Collection: config
-// - Document: main
-//   - shiftAbbreviations: list of strings
-//   - taskAbbreviations: list of strings
-//   - shiftPattern: map
-//
-// ===============================================================
-
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-
-    // Helper functions (kept for context if needed later)
-    function isAuthenticated() {
-      return true; // Bypassing auth check due to project restrictions on Anonymous Auth
-    }
-
-    // Rules - Allowing public access for now as the app uses a UI-level password gate.
-    // This resolves the 'auth/admin-restricted-operation' error.
     match /{document=**} {
-      allow read, write: if true;
+      allow read, write: if request.auth != null
+        && request.auth.uid == 'W2LqrexzUaUABKRAAf9lqIEj2NB3';
     }
   }
 }

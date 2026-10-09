@@ -18,6 +18,7 @@ export default defineConfig({
     env: sync ? {
       VITE_FIREBASE_CONFIG: JSON.stringify({ projectId: 'demo-kirinji', apiKey: 'demo-key', appId: 'demo-app', firestoreDatabaseId: '(default)' }),
       VITE_FIRESTORE_EMULATOR_HOST: '127.0.0.1:8080',
-    } : {},
+      VITE_AUTH_EMULATOR_HOST: '127.0.0.1:9099',
+    } : { VITE_FIREBASE_CONFIG: JSON.stringify({ projectId: 'demo-kirinji', apiKey: 'demo-key', appId: 'demo-app' }), VITE_DEMO_UI: '1' },
   },
 });

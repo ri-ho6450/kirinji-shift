@@ -59,8 +59,7 @@ import {
   waitForPendingWrites,
   writeBatch,
   orderBy,
-  limit,
-  User 
+  limit
 } from './firebase';
 
 // --- Types ---
@@ -963,7 +962,7 @@ const ShiftGridTable = React.memo(({
 
 export default function App() {
   // --- Auth State ---
-  const [currentUser] = useState<User | null>(() => ({ uid: 'shared-user', isAnonymous: true } as User));
+
 
   // --- UI State ---
   const [view, setView] = useState<'monthly' | 'individual' | 'daily_all' | 'settings'>('monthly');
